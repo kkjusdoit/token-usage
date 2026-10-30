@@ -66,6 +66,15 @@ class Channel:
     files_scanned: int
     malformed_lines: int
     usage: Usage
+    models: dict[str, Usage]
+
+
+def model_usage(models: dict[str, Usage], model: str) -> Usage:
+    label = model or "unknown"
+    usage = models.get(label)
+    if usage is None:
+        usage = models[label] = Usage()
+    return usage
 
 
 def integer(value: Any) -> int:
@@ -133,13 +142,13 @@ def summarize_claude(
     root: Path, start: datetime, end: datetime, full_scan: bool
 ) -> Channel:
     if not root.is_dir():
-        return Channel("Claude Code", str(root), "missing", 0, 0, Usage())
+        return Channel("Claude Code", str(root), "missing", 0, 0, Usage(), {})
 
     files = discover_jsonl([root], start.timestamp(), full_scan)
     # Claude Code writes one streaming response several times (thinking, text,
     # and tool-use blocks) with the same message.id. Only the latest record has
     # the final output token count, so retain exactly one record per message.
-    latest: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    latest: dict[str, tuple[datetime, dict[str, Any], str]] = {}
     malformed = 0
 
     for path in files:
@@ -170,12 +179,16 @@ def summarize_claude(
                     # silently dropping an otherwise valid usage record.
                     key = f"record:{path}:{record.get('uuid', timestamp.isoformat())}"
 
+            model = message.get("model")
+            model = model if isinstance(model, str) else ""
+
             previous = latest.get(key)
             if previous is None or timestamp >= previous[0]:
-                latest[key] = (timestamp, token_data)
+                latest[key] = (timestamp, token_data, model)
 
     usage = Usage()
-    for timestamp, token_data in latest.values():
+    models: dict[str, Usage] = {}
+    for timestamp, token_data, model in latest.values():
         if not start <= timestamp < end:
             continue
         uncached = integer(token_data.get("input_tokens"))
@@ -183,15 +196,18 @@ def summarize_claude(
         cache_read = integer(token_data.get("cache_read_input_tokens"))
         output = integer(token_data.get("output_tokens"))
         total = uncached + cache_write + cache_read + output
-        usage.add(
-            uncached_input=uncached,
-            cache_write=cache_write,
-            cache_read=cache_read,
-            output=output,
-            total=total,
-        )
+        for target in (usage, model_usage(models, model)):
+            target.add(
+                uncached_input=uncached,
+                cache_write=cache_write,
+                cache_read=cache_read,
+                output=output,
+                total=total,
+            )
 
-    return Channel("Claude Code", str(root), "ok", len(files), malformed, usage)
+    return Channel(
+        "Claude Code", str(root), "ok", len(files), malformed, usage, models
+    )
 
 
 def pb_varint(blob: bytes, offset: int) -> tuple[int, int]:
@@ -316,7 +332,7 @@ def summarize_antigravity(
 ) -> Channel:
     name = "Antigravity"
     if not root.is_dir():
-        return Channel(name, str(root), "missing", 0, 0, Usage())
+        return Channel(name, str(root), "missing", 0, 0, Usage(), {})
 
     files: list[Path] = []
     for path in root.glob("*.db"):
@@ -453,6 +469,7 @@ def summarize_antigravity(
                 errors += 1
 
     usage = Usage()
+    models: dict[str, Usage] = {}
     for timestamp, decoded in calls.values():
         if not start <= timestamp < end:
             continue
@@ -461,23 +478,27 @@ def summarize_antigravity(
         cache_read = int(decoded["cache_read"])
         output = int(decoded["output"])
         total = uncached + cache_write + cache_read + output
-        usage.add(
-            uncached_input=uncached,
-            cache_write=cache_write,
-            cache_read=cache_read,
-            output=output,
-            reasoning_output=int(decoded["thinking_output"]),
-            total=total,
-        )
+        # Antigravity only records the model as a private enum number.
+        model_id = int(decoded["model"])
+        model = f"model-{model_id}" if model_id else ""
+        for target in (usage, model_usage(models, model)):
+            target.add(
+                uncached_input=uncached,
+                cache_write=cache_write,
+                cache_read=cache_read,
+                output=output,
+                reasoning_output=int(decoded["thinking_output"]),
+                total=total,
+            )
 
-    return Channel(name, str(root), "ok", len(files), errors, usage)
+    return Channel(name, str(root), "ok", len(files), errors, usage, models)
 
 
 def summarize_opencode_db(
     name: str, db_path: Path, start: datetime, end: datetime, full_scan: bool
 ) -> Channel:
     if not db_path.is_file():
-        return Channel(name, str(db_path), "missing", 0, 0, Usage())
+        return Channel(name, str(db_path), "missing", 0, 0, Usage(), {})
 
     # Opencode and its forks (mimo) store one row per message in `message`;
     # the `data` JSON on assistant messages carries the per-call token counts.
@@ -487,6 +508,7 @@ def summarize_opencode_db(
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
     usage = Usage()
+    models: dict[str, Usage] = {}
     errors = 0
     connection: sqlite3.Connection | None = None
     try:
@@ -519,15 +541,18 @@ def summarize_opencode_db(
             total = uncached + cache_write + cache_read + output + reasoning
             if total == 0:
                 continue
-            usage.add(
-                uncached_input=uncached,
-                cache_write=cache_write,
-                cache_read=cache_read,
-                output=output,
-                reasoning_output=reasoning,
-                other=reasoning,
-                total=total,
-            )
+            model = record.get("modelID")
+            model = model if isinstance(model, str) else ""
+            for target in (usage, model_usage(models, model)):
+                target.add(
+                    uncached_input=uncached,
+                    cache_write=cache_write,
+                    cache_read=cache_read,
+                    output=output,
+                    reasoning_output=reasoning,
+                    other=reasoning,
+                    total=total,
+                )
     except (OSError, sqlite3.Error, TypeError, ValueError):
         errors += 1
     finally:
@@ -537,7 +562,7 @@ def summarize_opencode_db(
         except sqlite3.Error:
             errors += 1
 
-    return Channel(name, str(db_path), "ok", 1, errors, usage)
+    return Channel(name, str(db_path), "ok", 1, errors, usage, models)
 
 
 def summarize_gemini(
@@ -545,7 +570,7 @@ def summarize_gemini(
 ) -> Channel:
     name = "Gemini CLI"
     if not root.is_dir():
-        return Channel(name, str(root), "missing", 0, 0, Usage())
+        return Channel(name, str(root), "missing", 0, 0, Usage(), {})
 
     # Gemini CLI writes one JSON session file per chat under tmp/*/chats/.
     # Each `gemini` message carries tokens {input, output, cached, thoughts,
@@ -564,6 +589,7 @@ def summarize_gemini(
         files.append(path)
 
     usage = Usage()
+    models: dict[str, Usage] = {}
     malformed = 0
     for path in sorted(files):
         try:
@@ -593,24 +619,29 @@ def summarize_gemini(
             total = uncached + output + cached + thoughts + tool
             if total == 0:
                 continue
-            usage.add(
-                uncached_input=uncached,
-                cache_read=cached,
-                output=output,
-                reasoning_output=thoughts,
-                other=thoughts + tool,
-                total=total,
-            )
+            model = message.get("model")
+            model = model if isinstance(model, str) else ""
+            for target in (usage, model_usage(models, model)):
+                target.add(
+                    uncached_input=uncached,
+                    cache_read=cached,
+                    output=output,
+                    reasoning_output=thoughts,
+                    other=thoughts + tool,
+                    total=total,
+                )
 
-    return Channel(name, str(root), "ok", len(files), malformed, usage)
+    return Channel(name, str(root), "ok", len(files), malformed, usage, models)
 
 
 def choose_codex_files(
-    root: Path, start_epoch: float, full_scan: bool
+    roots: Path | Iterable[Path], start_epoch: float, full_scan: bool
 ) -> list[Path]:
-    candidates = discover_jsonl(
-        [root / "sessions", root / "archived_sessions"], start_epoch, full_scan
-    )
+    root_list = [roots] if isinstance(roots, Path) else list(roots)
+    search_dirs: list[Path] = []
+    for root in root_list:
+        search_dirs.extend([root / "sessions", root / "archived_sessions"])
+    candidates = discover_jsonl(search_dirs, start_epoch, full_scan)
     # A session can briefly exist in both locations while being archived.
     # Its rollout filename is stable, so choose the largest/newest copy.
     chosen: dict[str, Path] = {}
@@ -630,24 +661,43 @@ def choose_codex_files(
 
 
 def summarize_codex(
-    profile: int, root: Path, start: datetime, end: datetime, full_scan: bool
+    profile: int,
+    roots: Path | Iterable[Path],
+    start: datetime,
+    end: datetime,
+    full_scan: bool,
 ) -> Channel:
     name = f"Codex profile {profile}"
-    if not root.is_dir():
-        return Channel(name, str(root), "missing", 0, 0, Usage())
+    root_list = [roots] if isinstance(roots, Path) else list(roots)
+    valid_roots = [r for r in root_list if r.is_dir()]
+    if not valid_roots:
+        display_root = str(root_list[0]) if root_list else ""
+        return Channel(name, display_root, "missing", 0, 0, Usage(), {})
 
-    files = choose_codex_files(root, start.timestamp(), full_scan)
+    files = choose_codex_files(valid_roots, start.timestamp(), full_scan)
     malformed = 0
     usage = Usage()
+    models: dict[str, Usage] = {}
     seen_events: set[tuple[str, str, str]] = set()
 
     for path in files:
+        # token_count events do not name the model; turn_context events do and
+        # precede the calls they configure, so track the current model while
+        # streaming each rollout file.
+        current_model = ""
         for record, bad in read_jsonl(path):
             malformed += int(bad)
             if record is None:
                 continue
             payload = record.get("payload")
-            if record.get("type") != "event_msg" or not isinstance(payload, dict):
+            if not isinstance(payload, dict):
+                continue
+            if record.get("type") == "turn_context":
+                model = payload.get("model")
+                if isinstance(model, str) and model:
+                    current_model = model
+                continue
+            if record.get("type") != "event_msg":
                 continue
             if payload.get("type") != "token_count":
                 continue
@@ -678,27 +728,30 @@ def summarize_codex(
             # For Codex, cached_input_tokens is a subset of input_tokens.
             uncached = max(0, input_tokens - cached_input)
             other = total - component_total
-            usage.add(
-                uncached_input=uncached,
-                cache_read=cached_input,
-                output=output,
-                reasoning_output=reasoning,
-                other=other,
-                total=total,
-            )
+            for target in (usage, model_usage(models, current_model)):
+                target.add(
+                    uncached_input=uncached,
+                    cache_read=cached_input,
+                    output=output,
+                    reasoning_output=reasoning,
+                    other=other,
+                    total=total,
+                )
 
-    return Channel(name, str(root), "ok", len(files), malformed, usage)
+    display_root = str(valid_roots[0])
+    return Channel(name, display_root, "ok", len(files), malformed, usage, models)
 
 
-def codex_roots(home: Path) -> dict[int, Path]:
-    profile_zero = home / ".codex-profiles" / "profile-0"
-    if not profile_zero.is_dir():
-        profile_zero = home / ".codex"
+def codex_roots(home: Path) -> dict[int, list[Path]]:
+    profile_zero_dirs = [
+        home / ".codex",
+        home / ".codex-profiles" / "profile-0",
+    ]
     return {
-        0: profile_zero,
-        1: home / ".codex-profiles" / "profile-1",
-        2: home / ".codex-profiles" / "profile-2",
-        3: home / ".codex-profiles" / "profile-3",
+        0: [p for p in profile_zero_dirs if p.is_dir()] or [home / ".codex"],
+        1: [home / ".codex-profiles" / "profile-1"],
+        2: [home / ".codex-profiles" / "profile-2"],
+        3: [home / ".codex-profiles" / "profile-3"],
     }
 
 
@@ -717,9 +770,22 @@ def tokens_m(value: int) -> str:
     return f"{millions:,.1f}"
 
 
-def render_table(channels: list[Channel], total: Usage) -> str:
+def usage_row(label: str, usage: Usage) -> list[str]:
+    return [
+        label,
+        number(usage.calls),
+        tokens_m(usage.uncached_input_tokens),
+        tokens_m(usage.cache_write_tokens),
+        tokens_m(usage.cache_read_tokens),
+        tokens_m(usage.output_tokens),
+        tokens_m(usage.other_tokens),
+        tokens_m(usage.total_tokens),
+    ]
+
+
+def usage_table(first_header: str, rows: list[list[str]]) -> str:
     headers = [
-        "Channel",
+        first_header,
         "Calls",
         "UncachedIn/M",
         "CacheWrite/M",
@@ -728,50 +794,50 @@ def render_table(channels: list[Channel], total: Usage) -> str:
         "Other/M",
         "Total/M",
     ]
-    rows: list[list[str]] = []
-    for channel in channels:
-        label = channel.channel
-        if channel.status != "ok":
-            label += " (missing)"
-        u = channel.usage
-        rows.append(
-            [
-                label,
-                number(u.calls),
-                tokens_m(u.uncached_input_tokens),
-                tokens_m(u.cache_write_tokens),
-                tokens_m(u.cache_read_tokens),
-                tokens_m(u.output_tokens),
-                tokens_m(u.other_tokens),
-                tokens_m(u.total_tokens),
-            ]
-        )
-    rows.append(
-        [
-            "ALL CHANNELS",
-            number(total.calls),
-            tokens_m(total.uncached_input_tokens),
-            tokens_m(total.cache_write_tokens),
-            tokens_m(total.cache_read_tokens),
-            tokens_m(total.output_tokens),
-            tokens_m(total.other_tokens),
-            tokens_m(total.total_tokens),
-        ]
-    )
-
     widths = [
         max(len(headers[index]), *(len(row[index]) for row in rows))
         for index in range(len(headers))
     ]
 
-    def line(row: list[str], first_left: bool = True) -> str:
+    def line(row: list[str]) -> str:
         cells = []
         for index, value in enumerate(row):
-            cells.append(value.ljust(widths[index]) if index == 0 and first_left else value.rjust(widths[index]))
+            cells.append(
+                value.ljust(widths[index]) if index == 0 else value.rjust(widths[index])
+            )
         return "  ".join(cells)
 
     separator = "  ".join("-" * width for width in widths)
     return "\n".join([line(headers), separator, *(line(row) for row in rows)])
+
+
+def render_table(channels: list[Channel], total: Usage) -> str:
+    rows: list[list[str]] = []
+    for channel in channels:
+        label = channel.channel
+        if channel.status != "ok":
+            label += " (missing)"
+        rows.append(usage_row(label, channel.usage))
+    rows.append(usage_row("ALL CHANNELS", total))
+    return usage_table("Channel", rows)
+
+
+def render_model_table(channels: list[Channel]) -> str:
+    # The same model can appear in several channels (e.g. Claude models used
+    # from both Claude Code and OpenCode), so aggregate across channels.
+    models: dict[str, Usage] = {}
+    for channel in channels:
+        for model, usage in channel.models.items():
+            model_usage(models, model).merge(usage)
+    if not models:
+        return ""
+    rows = [
+        usage_row(model, usage)
+        for model, usage in sorted(
+            models.items(), key=lambda item: -item[1].total_tokens
+        )
+    ]
+    return usage_table("Model", rows)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -890,6 +956,13 @@ def main() -> int:
                     "files_scanned": channel.files_scanned,
                     "malformed_lines": channel.malformed_lines,
                     **asdict(channel.usage),
+                    "models": {
+                        model: asdict(usage)
+                        for model, usage in sorted(
+                            channel.models.items(),
+                            key=lambda item: -item[1].total_tokens,
+                        )
+                    },
                 }
                 for channel in channels
             ],
@@ -907,6 +980,10 @@ def main() -> int:
         )
         print()
         print(render_table(channels, total))
+        model_table = render_model_table(channels)
+        if model_table:
+            print()
+            print(model_table)
         print()
         print(
             "口径：UncachedIn + CacheWrite + CacheRead + Output + Other = Total，"
